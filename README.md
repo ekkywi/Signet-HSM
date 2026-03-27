@@ -1,18 +1,20 @@
-# 🛡️ Signet HSM: Enterprise-Grade Micro Hardware Security Module
+# 🛡️ Signet Hardware Root CA: Micro-PKI & Key Generation Engine
 
-**Signet HSM** is an ultra-low-cost, air-gapped Hardware Security Module (HSM) built on top of the ESP32 microcontroller. Designed specifically for secure software licensing and PaaS environments, it provides military-grade cryptographic signing capabilities without the risk of network-based exfiltration.
+**Signet HSM** has evolved into a dedicated **Hardware Certificate Authority (Root CA)** built on the ESP32 microcontroller. Designed to power the **Signet Cloud KMS** infrastructure, it provides military-grade cryptographic key generation and X.509 certificate stamping without the risk of network-based exfiltration.
 
-Built to power the infrastructure of **Trezanix**, Signet turns a standard ESP32 into a dedicated cryptographic engine capable of generating unforgeable Elliptic Curve Digital Signatures (ECDSA).
-
----
+Instead of signing individual daily licenses, Signet now acts as the ultimate Root of Trust. It dynamically generates mathematically unique RSA keypairs for every new software product and issues mathematically signed `.cert` passports directly from silicon.
 
 ## ✨ Core Features
 
-- **Military-Grade Cryptography:** Powered by the industry-standard `mbedTLS` library. Utilizes **ECDSA (secp256r1)** and **SHA-256** hashing—the same algorithms used in Bitcoin wallets and modern biometric passports.
-- **True Air-Gapped Security:** Zero network attack surface. WiFi and Bluetooth modules are strictly powered off at the firmware level (`WiFi.mode(WIFI_OFF)` and `btStop()`). Communication is restricted entirely to local Serial (USB).
-- **Deterministic Signatures (RFC 6979):** Protects against Side-Channel Attacks and Random Number Generator (RNG) failures. The same payload will reliably produce the same signature, preventing catastrophic nonce-leakage.
-- **JSON-over-Serial API:** Seamlessly communicates with backend servers (Laravel, Node.js, Go) using a strict, fast, and easily parsable JSON interface.
-- **Disaster Recovery Ready:** Uses a "Key Injection" architecture. If the hardware is physically destroyed, the Master Private Key can be safely flashed into a new $5 ESP32 board in under 60 seconds.
+- **On-Chip RSA Key Generation:** Powered by the ESP32's True Random Number Generator (TRNG) feeding into the mbedTLS CTR-DRBG algorithm. Generates highly secure, unique RSA-2048 keypairs entirely within the hardware.
+
+- **X.509 Certificate Stamping:** Acts as a standalone Certificate Authority. Automatically wraps newly generated public keys into standard X.509 certificates, cryptographically signed by the air-gapped Master Root Key.
+
+- **Heap-Optimized Cryptography:** Custom memory allocation (malloc/free) to safely perform heavy "Bignum" math operations in the Heap RAM, bypassing standard RTOS stack limitations and preventing kernel panics.
+
+- **True Air-Gapped Security:** Zero network attack surface. WiFi and Bluetooth modules are strictly powered off at the firmware level (WiFi.mode(WIFI_OFF) and btStop()).
+
+- **JSON-over-Serial API:** Seamlessly communicates with backend servers (via Node.js bridge to Laravel) using a strict, fast, and easily parsable JSON interface.
 
 ## 🧰 Hardware Requirements
 
@@ -66,18 +68,21 @@ Check if the HSM is alive and responding.
 **Response:**
 
 ```json
-{ "status": "ok", "message": "HSM is alive and secure" }
+{ "status": "ok", "message": "Signet Root CA is secure and operational" }
 ```
 
-### 2. Sign Payload (License Generation)
+### 2. Generate Product Identity (Keypair & Certificate)
 
-Generate a Base64-encoded ASN.1 DER signature for your license payload.
+Instruct the HSM to utilize its TRNG to generate a new RSA-2048 keypair and sign the public key into an X.509 Certificate. (Note: This operation takes 1-3 seconds of compute time).
+
 **Request:**
 
 ```json
 {
-  "action": "sign_license",
-  "data": "TRZX-9922-AABB|PRO_PLAN|2027-12-31|MAC-A1:B2:C3"
+  "action": "generate_identity",
+  "data": {
+    "product_name": "Awesome Product"
+  }
 }
 ```
 
@@ -86,15 +91,19 @@ Generate a Base64-encoded ASN.1 DER signature for your license payload.
 ```json
 {
   "status": "success",
-  "signature": "MEUCIAz5imXSFSlu2RYMXT9sTpgfSHWoF2kWKa5dTfQNPrPTAiEAunppl1Q1qulvX3GUlDMYe329UsvMfKSO2RLZwms7OLI="
+  "data": {
+    "raw_private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n",
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIICJzCCAc2gAwIBAg...\n-----END CERTIFICATE-----\n"
+  }
 }
 ```
 
-## 🔒 Security Architecture
+## 🔒 Security Architecture (Cloud KMS Model)
 
-1. **Isolation:** The Private Key is compiled directly into the ESP32's flash memory. It is never exported, printed, or transmitted over any interface.
-2. **Execution:** The Laravel/backend server constructs the license payload and sends it to the HSM. The HSM hashes the payload, signs it internally, and returns _only_ the cryptographic signature.
-3. **Validation:** Client applications verify the license entirely offline using the mathematically paired Public Key hardcoded in their source code.
+1. **Root Isolation:** The Master CA Key is compiled directly into the ESP32's flash memory. It never leaves the device.
+2. **Identity Creation:** When a new software product is registered, the HSM generates a unique keypair. The raw private key is sent back to the server (where Laravel encrypts it at rest using AES-256), alongside the globally distributable `.cert` file.
+3. **Delegated Signing:** To eliminate USB bottlenecks, the HSM is only used for high-value Root CA operations (Product Registration). High-frequency daily license validations are signed by the Cloud KMS using the software's specific encrypted private key.
+4. **Offline Validation:** Client applications verify their licenses entirely offline using the mathematically paired `.cert` file downloaded from the Signet Console.
 
 ## 📜 License
 

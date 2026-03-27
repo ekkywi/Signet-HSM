@@ -10,60 +10,120 @@
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/md.h"
+#include "mbedtls/x509_crt.h"
+#include "mbedtls/x509_csr.h"
 
 #define LED_PIN 2
 
-String signPayload(String dataToSign)
+int init_rng(mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy)
 {
-    mbedtls_pk_context pk;
-    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_init(ctr_drbg);
+    mbedtls_entropy_init(entropy);
+    const char *pers = "signet_hsm_root_ca";
+    return mbedtls_ctr_drbg_seed(ctr_drbg, mbedtls_entropy_func, entropy, (const unsigned char *)pers, strlen(pers));
+}
+
+String generateIdentity(String productName)
+{
+    mbedtls_pk_context product_key;
+    mbedtls_pk_context master_key;
     mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_context entropy;
+    mbedtls_x509write_cert crt;
+    mbedtls_mpi serial;
 
-    mbedtls_pk_init(&pk);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
+    unsigned char *priv_pem_buf = (unsigned char *)malloc(2000);
+    unsigned char *cert_pem_buf = (unsigned char *)malloc(2500);
 
-    String resultSignature = "";
-
-    const char *pers = "signet_hsm_drbg";
-    if (mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers)) != 0)
+    if (!priv_pem_buf || !cert_pem_buf)
     {
+        if (priv_pem_buf)
+            free(priv_pem_buf);
+        if (cert_pem_buf)
+            free(cert_pem_buf);
+        return "ERROR_OUT_OF_MEMORY";
+    }
+
+    memset(priv_pem_buf, 0, 2000);
+    memset(cert_pem_buf, 0, 2500);
+
+    mbedtls_pk_init(&product_key);
+    mbedtls_pk_init(&master_key);
+    mbedtls_x509write_crt_init(&crt);
+    mbedtls_mpi_init(&serial);
+
+    if (init_rng(&ctr_drbg, &entropy) != 0)
+    {
+        free(priv_pem_buf);
+        free(cert_pem_buf);
         return "ERROR_RNG_INIT";
     }
 
-    int ret = mbedtls_pk_parse_key(&pk, (const unsigned char *)SIGNET_PRIVATE_KEY, strlen(SIGNET_PRIVATE_KEY) + 1, NULL, 0);
-    if (ret != 0)
+    if (mbedtls_pk_parse_key(&master_key, (const unsigned char *)SIGNET_PRIVATE_KEY, strlen(SIGNET_PRIVATE_KEY) + 1, NULL, 0) != 0)
     {
-        return "ERROR_PARSE_KEY";
+        free(priv_pem_buf);
+        free(cert_pem_buf);
+        return "ERROR_PARSE_MASTER_KEY";
     }
 
-    unsigned char hash[32];
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&ctx);
-    mbedtls_md_update(&ctx, (const unsigned char *)dataToSign.c_str(), dataToSign.length());
-    mbedtls_md_finish(&ctx, hash);
-    mbedtls_md_free(&ctx);
-
-    unsigned char sig[MBEDTLS_MPI_MAX_SIZE];
-    size_t sig_len = 0;
-    ret = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, &sig_len, mbedtls_ctr_drbg_random, &ctr_drbg);
-
-    if (ret == 0)
+    mbedtls_pk_setup(&product_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+    if (mbedtls_rsa_gen_key(mbedtls_pk_rsa(product_key), mbedtls_ctr_drbg_random, &ctr_drbg, 2048, 65537) != 0)
     {
-        resultSignature = base64::encode(sig, sig_len);
-    }
-    else
-    {
-        resultSignature = "ERROR_SIGNING_PROCESS";
+        free(priv_pem_buf);
+        free(cert_pem_buf);
+        return "ERROR_KEY_GENERATION";
     }
 
-    mbedtls_pk_free(&pk);
+    mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
+    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+
+    mbedtls_x509write_crt_set_subject_key(&crt, &product_key);
+    mbedtls_x509write_crt_set_issuer_key(&crt, &master_key);
+
+    String subjectName = "CN=" + productName;
+    mbedtls_x509write_crt_set_subject_name(&crt, subjectName.c_str());
+    mbedtls_x509write_crt_set_issuer_name(&crt, "CN=Signet Hardware Root CA,O=Trezanix,C=ID");
+
+    mbedtls_x509write_crt_set_validity(&crt, "20240101000000", "20340101000000");
+    mbedtls_x509write_crt_set_basic_constraints(&crt, 0, -1);
+
+    mbedtls_mpi_read_string(&serial, 10, "1");
+    mbedtls_x509write_crt_set_serial(&crt, &serial);
+
+    if (mbedtls_pk_write_key_pem(&product_key, priv_pem_buf, 2000) != 0)
+    {
+        free(priv_pem_buf);
+        free(cert_pem_buf);
+        return "ERROR_PRIV_KEY_WRITE";
+    }
+
+    if (mbedtls_x509write_crt_pem(&crt, cert_pem_buf, 2500, mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
+    {
+        free(priv_pem_buf);
+        free(cert_pem_buf);
+        return "ERROR_CERT_CREATION";
+    }
+
+    JsonDocument responseDoc;
+    responseDoc["status"] = "success";
+
+    JsonObject data = responseDoc["data"].to<JsonObject>();
+    data["raw_private_key"] = String((char *)priv_pem_buf);
+    data["certificate"] = String((char *)cert_pem_buf);
+
+    String jsonOutput;
+    serializeJson(responseDoc, jsonOutput);
+
+    mbedtls_pk_free(&product_key);
+    mbedtls_pk_free(&master_key);
+    mbedtls_x509write_crt_free(&crt);
+    mbedtls_mpi_free(&serial);
     mbedtls_entropy_free(&entropy);
     mbedtls_ctr_drbg_free(&ctr_drbg);
+    free(priv_pem_buf);
+    free(cert_pem_buf);
 
-    return resultSignature;
+    return jsonOutput;
 }
 
 void setup()
@@ -74,7 +134,7 @@ void setup()
     WiFi.mode(WIFI_OFF);
     btStop();
     delay(1000);
-    Serial.println("{\"status\":\"ready\",\"message\":\"SIGNET_HSM_BOOT_COMPLETE\"}");
+    Serial.println("{\"status\":\"ready\",\"message\":\"SIGNET_ROOT_CA_BOOT_COMPLETE\"}");
 }
 
 void loop()
@@ -88,9 +148,7 @@ void loop()
 
         if (error)
         {
-            Serial.print("{\"status\":\"error\",\"message\":\"Invalid JSON Format: ");
-            Serial.print(error.c_str());
-            Serial.println("\"}");
+            Serial.print("{\"status\":\"error\",\"message\":\"Invalid JSON Format\"}");
             return;
         }
 
@@ -99,25 +157,23 @@ void loop()
 
         if (action == "ping")
         {
-            Serial.println("{\"status\":\"ok\",\"message\":\"HSM is alive and secure\"}");
+            Serial.println("{\"status\":\"ok\",\"message\":\"Signet Root CA is secure and operational\"}");
         }
-        else if (action == "sign_license")
+        else if (action == "generate_identity")
         {
-            String dataToSign = doc["data"] | "";
+            String productName = doc["data"]["product_name"] | "Unknown Product";
 
-            String signatureBase64 = signPayload(dataToSign);
+            String resultJson = generateIdentity(productName);
 
-            if (signatureBase64.startsWith("ERROR"))
+            if (resultJson.startsWith("ERROR"))
             {
                 Serial.print("{\"status\":\"error\",\"message\":\"");
-                Serial.print(signatureBase64);
+                Serial.print(resultJson);
                 Serial.println("\"}");
             }
             else
             {
-                Serial.print("{\"status\":\"success\",\"signature\":\"");
-                Serial.print(signatureBase64);
-                Serial.println("\"}");
+                Serial.println(resultJson);
             }
         }
         else
