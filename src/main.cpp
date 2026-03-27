@@ -128,6 +128,7 @@ String generateIdentity(String productName)
 
 void setup()
 {
+    Serial.setTxBufferSize(4096);
     Serial.begin(115200);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
