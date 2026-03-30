@@ -12,6 +12,7 @@
 #include "mbedtls/md.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/x509_csr.h"
+#include "mbedtls/base64.h"
 
 #define LED_PIN 2
 
@@ -126,6 +127,66 @@ String generateIdentity(String productName)
     return jsonOutput;
 }
 
+String signPayload(String privateKeyPem, String payloadData)
+{
+    mbedtls_pk_context pk;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+
+    mbedtls_pk_init(&pk);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    const char *pers = "signet_signer";
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers));
+
+    int ret = mbedtls_pk_parse_key(&pk, (const unsigned char *)privateKeyPem.c_str(), privateKeyPem.length() + 1, NULL, 0);
+    if (ret != 0)
+    {
+        mbedtls_pk_free(&pk);
+        return "ERROR_PARSE_PRIVATE_KEY";
+    }
+
+    unsigned char hash[32];
+    mbedtls_md_context_t md_ctx;
+    mbedtls_md_init(&md_ctx);
+    mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+    mbedtls_md_starts(&md_ctx);
+    mbedtls_md_update(&md_ctx, (const unsigned char *)payloadData.c_str(), payloadData.length());
+    mbedtls_md_finish(&md_ctx, hash);
+    mbedtls_md_free(&md_ctx);
+
+    unsigned char sig[MBEDTLS_MPI_MAX_SIZE];
+    size_t sig_len;
+    ret = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, sig, &sig_len, mbedtls_ctr_drbg_random, &ctr_drbg);
+    if (ret != 0)
+    {
+        mbedtls_pk_free(&pk);
+        return "ERROR_SIGNING_PROCESS";
+    }
+
+    unsigned char base64_sig[512];
+    size_t base64_len;
+    ret = mbedtls_base64_encode(base64_sig, sizeof(base64_sig), &base64_len, sig, sig_len);
+    if (ret != 0)
+    {
+        mbedtls_pk_free(&pk);
+        return "ERROR_BASE64_ENCODE";
+    }
+
+    mbedtls_pk_free(&pk);
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+
+    JsonDocument responseDoc;
+    responseDoc["status"] = "success";
+    responseDoc["data"]["signature"] = String((char *)base64_sig);
+
+    String jsonOutput;
+    serializeJson(responseDoc, jsonOutput);
+    return jsonOutput;
+}
+
 void setup()
 {
     Serial.setTxBufferSize(4096);
@@ -153,17 +214,16 @@ void loop()
             return;
         }
 
-        String action = doc["action"] | "unknown";
+        String action = doc["command"] | doc["action"] | "unknown";
         digitalWrite(LED_PIN, HIGH);
 
         if (action == "ping")
         {
             Serial.println("{\"status\":\"ok\",\"message\":\"Signet Root CA is secure and operational\"}");
         }
-        else if (action == "generate_identity")
+        else if (action == "GENERATE_IDENTITY")
         {
             String productName = doc["data"]["product_name"] | "Unknown Product";
-
             String resultJson = generateIdentity(productName);
 
             if (resultJson.startsWith("ERROR"))
@@ -175,6 +235,30 @@ void loop()
             else
             {
                 Serial.println(resultJson);
+            }
+        }
+        else if (action == "SIGN_PAYLOAD")
+        {
+            String pk = doc["privateKey"] | "";
+            String pld = doc["payload"] | "";
+
+            if (pk == "" || pld == "")
+            {
+                Serial.println("{\"status\":\"error\",\"message\":\"Missing privateKey or payload\"}");
+            }
+            else
+            {
+                String resultJson = signPayload(pk, pld);
+                if (resultJson.startsWith("ERROR"))
+                {
+                    Serial.print("{\"status\":\"error\",\"message\":\"");
+                    Serial.print(resultJson);
+                    Serial.println("\"}");
+                }
+                else
+                {
+                    Serial.println(resultJson);
+                }
             }
         }
         else
