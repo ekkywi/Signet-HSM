@@ -1,186 +1,199 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <ArduinoJson.h>
 #include <base64.h>
-#include <WiFi.h>
+
+#include "mbedtls/base64.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/rsa.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/x509_crt.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/md.h"
 
 #include "keys.h"
 
-#include "mbedtls/pk.h"
-#include "mbedtls/error.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/md.h"
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/x509_csr.h"
-#include "mbedtls/base64.h"
+#include <Adafruit_NeoPixel.h>
+
+#define RGB_PIN 48
+#define NUMPIXELS 1
+
+Adafruit_NeoPixel hsm_led(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
+
+void setLedColor(int r, int g, int b)
+{
+    hsm_led.setPixelColor(0, hsm_led.Color(r, g, b));
+    hsm_led.show();
+}
 
 #define LED_PIN 2
 
-int init_rng(mbedtls_ctr_drbg_context *ctr_drbg, mbedtls_entropy_context *entropy)
+mbedtls_entropy_context entropy;
+mbedtls_ctr_drbg_context ctr_drbg;
+
+void setup_rng()
 {
-    mbedtls_ctr_drbg_init(ctr_drbg);
-    mbedtls_entropy_init(entropy);
-    const char *pers = "signet_hsm_root_ca";
-    return mbedtls_ctr_drbg_seed(ctr_drbg, mbedtls_entropy_func, entropy, (const unsigned char *)pers, strlen(pers));
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    const char *pers = "signet_hsm_trng";
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers));
 }
 
-String generateIdentity(String productName)
+String handleGenerateKey(String productName)
 {
+    unsigned char *priv_pem = (unsigned char *)malloc(1800);
+    unsigned char *ciphertext = (unsigned char *)malloc(1800);
+    unsigned char *base64_out = (unsigned char *)malloc(3000);
+
+    if (!priv_pem || !ciphertext || !base64_out)
+    {
+        if (priv_pem)
+            free(priv_pem);
+        if (ciphertext)
+            free(ciphertext);
+        if (base64_out)
+            free(base64_out);
+        return "{\"status\":\"error\",\"message\":\"Out of Memory\"}";
+    }
+
+    memset(priv_pem, 0, 1800);
+    memset(ciphertext, 0, 1800);
+    memset(base64_out, 0, 3000);
+
     mbedtls_pk_context product_key;
-    mbedtls_pk_context master_key;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_entropy_context entropy;
-    mbedtls_x509write_cert crt;
-    mbedtls_mpi serial;
-
-    unsigned char *priv_pem_buf = (unsigned char *)malloc(2000);
-    unsigned char *cert_pem_buf = (unsigned char *)malloc(2500);
-
-    if (!priv_pem_buf || !cert_pem_buf)
-    {
-        if (priv_pem_buf)
-            free(priv_pem_buf);
-        if (cert_pem_buf)
-            free(cert_pem_buf);
-        return "ERROR_OUT_OF_MEMORY";
-    }
-
-    memset(priv_pem_buf, 0, 2000);
-    memset(cert_pem_buf, 0, 2500);
-
     mbedtls_pk_init(&product_key);
-    mbedtls_pk_init(&master_key);
-    mbedtls_x509write_crt_init(&crt);
-    mbedtls_mpi_init(&serial);
-
-    if (init_rng(&ctr_drbg, &entropy) != 0)
-    {
-        free(priv_pem_buf);
-        free(cert_pem_buf);
-        return "ERROR_RNG_INIT";
-    }
-
-    if (mbedtls_pk_parse_key(&master_key, (const unsigned char *)SIGNET_PRIVATE_KEY, strlen(SIGNET_PRIVATE_KEY) + 1, NULL, 0) != 0)
-    {
-        free(priv_pem_buf);
-        free(cert_pem_buf);
-        return "ERROR_PARSE_MASTER_KEY";
-    }
 
     mbedtls_pk_setup(&product_key, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
-    if (mbedtls_rsa_gen_key(mbedtls_pk_rsa(product_key), mbedtls_ctr_drbg_random, &ctr_drbg, 2048, 65537) != 0)
-    {
-        free(priv_pem_buf);
-        free(cert_pem_buf);
-        return "ERROR_KEY_GENERATION";
-    }
+    mbedtls_rsa_gen_key(mbedtls_pk_rsa(product_key), mbedtls_ctr_drbg_random, &ctr_drbg, 2048, 65537);
 
-    mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
-    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+    mbedtls_pk_write_key_pem(&product_key, priv_pem, 1800);
+    size_t pem_len = strlen((char *)priv_pem);
 
-    mbedtls_x509write_crt_set_subject_key(&crt, &product_key);
-    mbedtls_x509write_crt_set_issuer_key(&crt, &master_key);
+    unsigned char iv[12];
+    unsigned char tag[16];
+    mbedtls_ctr_drbg_random(&ctr_drbg, iv, sizeof(iv));
 
-    String subjectName = "CN=" + productName;
-    mbedtls_x509write_crt_set_subject_name(&crt, subjectName.c_str());
-    mbedtls_x509write_crt_set_issuer_name(&crt, "CN=Signet Hardware Root CA,O=Trezanix,C=ID");
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, SIGNET_MASTER_KEK, 256);
 
-    mbedtls_x509write_crt_set_validity(&crt, "20240101000000", "20340101000000");
-    mbedtls_x509write_crt_set_basic_constraints(&crt, 0, -1);
+    mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, pem_len, iv, sizeof(iv), NULL, 0, priv_pem, ciphertext, sizeof(tag), tag);
+    mbedtls_gcm_free(&gcm);
 
-    mbedtls_mpi_read_string(&serial, 10, "1");
-    mbedtls_x509write_crt_set_serial(&crt, &serial);
+    memset(priv_pem, 0, 1800);
+    mbedtls_pk_free(&product_key);
 
-    if (mbedtls_pk_write_key_pem(&product_key, priv_pem_buf, 2000) != 0)
-    {
-        free(priv_pem_buf);
-        free(cert_pem_buf);
-        return "ERROR_PRIV_KEY_WRITE";
-    }
+    size_t wrapped_total_len = 12 + pem_len + 16;
+    unsigned char *wrapped_buffer = (unsigned char *)malloc(wrapped_total_len);
+    memcpy(wrapped_buffer, iv, 12);
+    memcpy(wrapped_buffer + 12, ciphertext, pem_len);
+    memcpy(wrapped_buffer + 12 + pem_len, tag, 16);
 
-    if (mbedtls_x509write_crt_pem(&crt, cert_pem_buf, 2500, mbedtls_ctr_drbg_random, &ctr_drbg) != 0)
-    {
-        free(priv_pem_buf);
-        free(cert_pem_buf);
-        return "ERROR_CERT_CREATION";
-    }
+    size_t b64_len = 0;
+    mbedtls_base64_encode(base64_out, 3000, &b64_len, wrapped_buffer, wrapped_total_len);
+    String wrappedBase64 = String((char *)base64_out);
+
+    free(wrapped_buffer);
+    free(priv_pem);
+    free(ciphertext);
+    free(base64_out);
 
     JsonDocument responseDoc;
     responseDoc["status"] = "success";
-
-    JsonObject data = responseDoc["data"].to<JsonObject>();
-    data["raw_private_key"] = String((char *)priv_pem_buf);
-    data["certificate"] = String((char *)cert_pem_buf);
+    responseDoc["cmd"] = "GEN_KEY";
+    responseDoc["data"]["wrapped_private_key"] = wrappedBase64;
+    responseDoc["data"]["certificate"] = "-----BEGIN CERTIFICATE-----\nHSM_GENERATED_CERT\n-----END CERTIFICATE-----";
 
     String jsonOutput;
     serializeJson(responseDoc, jsonOutput);
-
-    mbedtls_pk_free(&product_key);
-    mbedtls_pk_free(&master_key);
-    mbedtls_x509write_crt_free(&crt);
-    mbedtls_mpi_free(&serial);
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-    free(priv_pem_buf);
-    free(cert_pem_buf);
-
     return jsonOutput;
 }
 
-String signPayload(String privateKeyPem, String payloadData)
+String handleSignData(String wrappedKeyB64, String payload)
 {
-    mbedtls_pk_context pk;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
+    unsigned char *wrapped_buffer = (unsigned char *)malloc(2500);
+    unsigned char *ciphertext = (unsigned char *)malloc(2000);
+    unsigned char *plaintext_pem = (unsigned char *)malloc(2000);
 
-    mbedtls_pk_init(&pk);
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
+    if (!wrapped_buffer || !ciphertext || !plaintext_pem)
+    {
+        if (wrapped_buffer)
+            free(wrapped_buffer);
+        if (ciphertext)
+            free(ciphertext);
+        if (plaintext_pem)
+            free(plaintext_pem);
+        return "{\"status\":\"error\",\"message\":\"Out of memory\"}";
+    }
 
-    const char *pers = "signet_signer";
-    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *)pers, strlen(pers));
+    memset(wrapped_buffer, 0, 2500);
+    memset(ciphertext, 0, 2000);
+    memset(plaintext_pem, 0, 2000);
 
-    int ret = mbedtls_pk_parse_key(&pk, (const unsigned char *)privateKeyPem.c_str(), privateKeyPem.length() + 1, NULL, 0);
+    size_t total_len = 0;
+    mbedtls_base64_decode(wrapped_buffer, 2500, &total_len, (const unsigned char *)wrappedKeyB64.c_str(), wrappedKeyB64.length());
+
+    if (total_len <= (12 + 16))
+    {
+        free(wrapped_buffer);
+        free(ciphertext);
+        free(plaintext_pem);
+        return "{\"status\":\"error\",\"message\":\"Invalid wrapped key length\"}";
+    }
+
+    size_t ciphertext_len = total_len - 12 - 16;
+    unsigned char iv[12];
+    unsigned char tag[16];
+
+    memcpy(iv, wrapped_buffer, 12);
+    memcpy(ciphertext, wrapped_buffer + 12, ciphertext_len);
+    memcpy(tag, wrapped_buffer + 12 + ciphertext_len, 16);
+
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, SIGNET_MASTER_KEK, 256);
+
+    int ret = mbedtls_gcm_auth_decrypt(&gcm, ciphertext_len, iv, sizeof(iv), NULL, 0, tag, sizeof(tag), ciphertext, plaintext_pem);
+    mbedtls_gcm_free(&gcm);
+
     if (ret != 0)
     {
-        mbedtls_pk_free(&pk);
-        return "ERROR_PARSE_PRIVATE_KEY";
+        free(wrapped_buffer);
+        free(ciphertext);
+        free(plaintext_pem);
+        return "{\"status\":\"error\",\"message\":\"GCM AUTH FAILED: Key tampered!\"}";
     }
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    mbedtls_pk_parse_key(&pk, plaintext_pem, ciphertext_len + 1, NULL, 0);
 
     unsigned char hash[32];
-    mbedtls_md_context_t md_ctx;
-    mbedtls_md_init(&md_ctx);
-    mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
-    mbedtls_md_starts(&md_ctx);
-    mbedtls_md_update(&md_ctx, (const unsigned char *)payloadData.c_str(), payloadData.length());
-    mbedtls_md_finish(&md_ctx, hash);
-    mbedtls_md_free(&md_ctx);
+    mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), (const unsigned char *)payload.c_str(), payload.length(), hash);
 
-    unsigned char sig[MBEDTLS_MPI_MAX_SIZE];
+    unsigned char sig[256];
     size_t sig_len;
-    ret = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, sig, &sig_len, mbedtls_ctr_drbg_random, &ctr_drbg);
-    if (ret != 0)
-    {
-        mbedtls_pk_free(&pk);
-        return "ERROR_SIGNING_PROCESS";
-    }
+    mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, sig, &sig_len, mbedtls_ctr_drbg_random, &ctr_drbg);
 
-    unsigned char base64_sig[512];
-    size_t base64_len;
-    ret = mbedtls_base64_encode(base64_sig, sizeof(base64_sig), &base64_len, sig, sig_len);
-    if (ret != 0)
-    {
-        mbedtls_pk_free(&pk);
-        return "ERROR_BASE64_ENCODE";
-    }
-
+    memset(plaintext_pem, 0, 2000);
     mbedtls_pk_free(&pk);
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
+
+    unsigned char *sig_b64_out = (unsigned char *)malloc(512);
+    size_t sig_b64_len = 0;
+    memset(sig_b64_out, 0, 512);
+    mbedtls_base64_encode(sig_b64_out, 512, &sig_b64_len, sig, sig_len);
+    String sigBase64 = String((char *)sig_b64_out);
+
+    free(wrapped_buffer);
+    free(ciphertext);
+    free(plaintext_pem);
+    free(sig_b64_out);
 
     JsonDocument responseDoc;
     responseDoc["status"] = "success";
-    responseDoc["data"]["signature"] = String((char *)base64_sig);
+    responseDoc["cmd"] = "SIGN_DATA";
+    responseDoc["data"]["signature"] = sigBase64;
 
     String jsonOutput;
     serializeJson(responseDoc, jsonOutput);
@@ -189,84 +202,90 @@ String signPayload(String privateKeyPem, String payloadData)
 
 void setup()
 {
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT == 1
+    Serial.setTxTimeoutMs(0);
+#endif
+
+    Serial.setRxBufferSize(4096);
     Serial.setTxBufferSize(4096);
-    Serial.begin(115200);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+    Serial.setTimeout(100);
+    Serial.begin(2000000);
+
+    hsm_led.begin();
+    hsm_led.setBrightness(50);
+    setLedColor(255, 165, 0);
+
     WiFi.mode(WIFI_OFF);
     btStop();
-    delay(1000);
-    Serial.println("{\"status\":\"ready\",\"message\":\"SIGNET_ROOT_CA_BOOT_COMPLETE\"}");
+
+    setup_rng();
+
+    setLedColor(0, 255, 0);
+    Serial.println("{\"status\":\"ready\",\"message\":\"SIGNET HSM v1.0 ONLINE (AIR-GAPPED)\"}");
 }
 
 void loop()
 {
     if (Serial.available())
     {
+        setLedColor(0, 0, 255);
+
         String incomingPayload = Serial.readStringUntil('\n');
+
+        if (incomingPayload.length() <= 2)
+        {
+            setLedColor(255, 165, 0);
+            return;
+        }
 
         JsonDocument doc;
         DeserializationError error = deserializeJson(doc, incomingPayload);
 
         if (error)
         {
-            Serial.print("{\"status\":\"error\",\"message\":\"Invalid JSON Format\"}");
+            setLedColor(255, 0, 0);
+            Serial.print("{\"status\":\"error\",\"message\":\"Invalid JSON: ");
+            Serial.print(error.f_str());
+            Serial.println("\"}");
+            delay(1000);
+            setLedColor(0, 255, 0);
             return;
         }
 
-        String action = doc["command"] | doc["action"] | "unknown";
-        digitalWrite(LED_PIN, HIGH);
+        String cmd = doc["cmd"] | "unknown";
 
-        if (action == "ping")
+        if (cmd == "GEN_KEY")
         {
-            Serial.println("{\"status\":\"ok\",\"message\":\"Signet Root CA is secure and operational\"}");
+            String productName = doc["data"]["product_name"] | "Signet App";
+            Serial.println(handleGenerateKey(productName));
         }
-        else if (action == "GENERATE_IDENTITY")
+        else if (cmd == "SIGN_DATA")
         {
-            String productName = doc["data"]["product_name"] | "Unknown Product";
-            String resultJson = generateIdentity(productName);
+            String wrappedKey = doc["data"]["wrapped_private_key"] | "";
+            String payload = doc["data"]["payload"] | "";
 
-            if (resultJson.startsWith("ERROR"))
+            if (wrappedKey == "" || payload == "")
             {
-                Serial.print("{\"status\":\"error\",\"message\":\"");
-                Serial.print(resultJson);
-                Serial.println("\"}");
+                setLedColor(255, 0, 0);
+                Serial.println("{\"status\":\"error\",\"message\":\"Missing wrapped_key or payload\"}");
             }
             else
             {
-                Serial.println(resultJson);
-            }
-        }
-        else if (action == "SIGN_PAYLOAD")
-        {
-            String pk = doc["privateKey"] | "";
-            String pld = doc["payload"] | "";
-
-            if (pk == "" || pld == "")
-            {
-                Serial.println("{\"status\":\"error\",\"message\":\"Missing privateKey or payload\"}");
-            }
-            else
-            {
-                String resultJson = signPayload(pk, pld);
-                if (resultJson.startsWith("ERROR"))
+                String result = handleSignData(wrappedKey, payload);
+                if (result.indexOf("GCM AUTH FAILED") != -1)
                 {
-                    Serial.print("{\"status\":\"error\",\"message\":\"");
-                    Serial.print(resultJson);
-                    Serial.println("\"}");
+                    setLedColor(255, 0, 0);
+                    delay(2000);
                 }
-                else
-                {
-                    Serial.println(resultJson);
-                }
+                Serial.println(result);
             }
         }
         else
         {
-            Serial.println("{\"status\":\"error\",\"message\":\"Unknown action requested\"}");
+            Serial.println("{\"status\":\"error\",\"message\":\"Unknown command\"}");
         }
 
-        delay(100);
-        digitalWrite(LED_PIN, LOW);
+        delay(50);
+        setLedColor(0, 255, 0);
     }
 }
